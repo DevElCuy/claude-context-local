@@ -123,8 +123,13 @@ def get_embedder():
         llama_url = os.getenv('LLAMA_SERVER_URL', 'http://localhost:10101')
 
         if use_llama:
-            logger.info(f"Using llama-server embedder at {llama_url}")
-            _embedder = LlamaServerEmbedder(base_url=llama_url)
+            # Get configurable timeout and batch size
+            timeout = int(os.getenv('LLAMA_SERVER_TIMEOUT', os.getenv('CLAUDE_MCP_LLAMA_TIMEOUT', '60')))
+            batch_size = int(os.getenv('LLAMA_SERVER_BATCH_SIZE', os.getenv('CLAUDE_MCP_LLAMA_BATCH', '32')))
+            logger.info(
+                f"Using llama-server embedder at {llama_url} (timeout: {timeout}s, batch_size: {batch_size})"
+            )
+            _embedder = LlamaServerEmbedder(base_url=llama_url, timeout=timeout, batch_size=batch_size)
         else:
             cache_dir = get_storage_dir() / "models"
             cache_dir.mkdir(exist_ok=True)

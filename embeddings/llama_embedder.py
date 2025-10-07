@@ -26,12 +26,14 @@ class LlamaServerEmbedder:
         base_url: str = "http://localhost:10101",
         model_name: str = "nomic-embed-text",
         api_key: Optional[str] = "-",
-        timeout: int = 30
+        timeout: int = 30,
+        batch_size: int = 32
     ):
         self.base_url = base_url.rstrip('/')
         self.model_name = model_name
         self.api_key = api_key
         self.timeout = timeout
+        self.batch_size = max(1, batch_size)
         self._logger = logging.getLogger(__name__)
         self._embedding_dim = None
 
@@ -150,7 +152,8 @@ class LlamaServerEmbedder:
 
     def embed_chunk(self, chunk: CodeChunk) -> EmbeddingResult:
         """Generate embedding for a single code chunk."""
-        content = self.create_embedding_content(chunk)
+        max_inputs = int(os.getenv('LLAMA_SERVER_MAX_INPUTS', os.getenv('CLAUDE_MCP_LLAMA_MAX_INPUTS', '2048')))
+        content = self.create_embedding_content(chunk, max_chars=max_inputs)
 
         # Get embedding from llama-server
         embeddings = self._get_embeddings([content])
@@ -185,19 +188,41 @@ class LlamaServerEmbedder:
             metadata=metadata
         )
 
-    def embed_chunks(self, chunks: List[CodeChunk], batch_size: int = 32) -> List[EmbeddingResult]:
+    def embed_chunks(self, chunks: List[CodeChunk], batch_size: Optional[int] = None) -> List[EmbeddingResult]:
         """Generate embeddings for multiple chunks with batching."""
         results = []
 
-        self._logger.info(f"Generating embeddings for {len(chunks)} chunks")
+        effective_batch_size = self.batch_size if batch_size is None else max(1, batch_size)
+        self._logger.info(
+            f"Generating embeddings for {len(chunks)} chunks (batch_size={effective_batch_size})"
+        )
+
+        # Get max chars per chunk from env var
+        max_chars_per_chunk = int(os.getenv('LLAMA_SERVER_MAX_INPUTS', os.getenv('CLAUDE_MCP_LLAMA_MAX_INPUTS', '2048')))
 
         # Process in batches for efficiency
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            batch_contents = [self.create_embedding_content(chunk) for chunk in batch]
+        for i in range(0, len(chunks), effective_batch_size):
+            batch = chunks[i:i + effective_batch_size]
+            batch_contents = [self.create_embedding_content(chunk, max_chars=max_chars_per_chunk) for chunk in batch]
+
+            # Respect llama-server API limit if provided via env var
+            max_batch_inputs = max_chars_per_chunk
+            if len(batch_contents) > max_batch_inputs:
+                raise ValueError(
+                    f"Batch size {len(batch_contents)} exceeds llama-server input limit ({max_batch_inputs})"
+                )
 
             # Generate embeddings for batch
-            batch_embeddings = self._get_embeddings(batch_contents)
+            try:
+                batch_embeddings = self._get_embeddings(batch_contents)
+            except RuntimeError as exc:
+                if effective_batch_size == 1:
+                    raise
+                self._logger.warning(
+                    "Embedding batch failed; retrying with batch_size=1 for remaining chunks: %s",
+                    exc
+                )
+                return results + self.embed_chunks(chunks[i:], batch_size=1)
 
             # Create results
             for j, (chunk, embedding) in enumerate(zip(batch, batch_embeddings)):
@@ -228,8 +253,8 @@ class LlamaServerEmbedder:
                     metadata=metadata
                 ))
 
-            if i + batch_size < len(chunks):
-                self._logger.info(f"Processed {i + batch_size}/{len(chunks)} chunks")
+            if i + effective_batch_size < len(chunks):
+                self._logger.info(f"Processed {i + effective_batch_size}/{len(chunks)} chunks")
 
         self._logger.info("Embedding generation completed")
         return results
